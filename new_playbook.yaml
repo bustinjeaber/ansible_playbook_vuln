@@ -1,0 +1,179 @@
+---
+- name: Deploy web application in Docker container
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    app_user: "appadmin"
+    download_url: "https://github.com/octocat/Hello-World/tarball/master"
+    download_checksum: "sha256:test" #здесь указывается чексумма
+    work_dir: "/opt/webapp"
+    container_name: "nginx"
+    image_version: "stable"
+    htpasswd_content: "appadmin:$hp"  #пароль и логин для htpaasswd
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      tags: packages
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - apache2-utils  #для создания .htpasswd
+          - trivy         #для сканирования образов
+        state: present
+      tags: packages
+
+    - name: Ensure Docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: yes
+      tags: docker
+
+    - name: Web application user exists
+      user:
+        name: "{{ app_user }}"
+        password: "{{ lookup('env', 'APP_PASSWORD') | password_hash('sha512') }}"
+        update_password: on_create
+      tags: users
+
+    - name: Configure UFW to allow port 8080
+      ufw:
+        rule: allow
+        port: 8080
+        proto: tcp
+      tags: network
+
+    - name: Enable UFW with deny policy
+      ufw:
+        state: enabled
+        policy: deny
+      tags: network
+
+    - name: Download application archive with checksum
+      get_url:
+        url: "{{ download_url }}"
+        dest: "/tmp/app.tar.gz"
+        checksum: "{{ download_checksum }}"
+      tags: download
+
+    - name: Ensure working directory exists
+      file:
+        path: "{{ work_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+      tags: deploy
+
+    - name: Extract application archive
+      unarchive:
+        src: "/tmp/app.tar.gz"
+        dest: "{{ work_dir }}"
+        remote_src: yes
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+      tags: deploy
+
+    - name: Generate secret token
+      shell: openssl rand -hex 16
+      register: secret_token
+      changed_when: false
+      tags: token
+
+    - name: Create Nginx configuration
+      copy:
+        dest: "{{ work_dir }}/conf.d/default.conf"
+        content: |
+          server {
+              listen 80;
+              server_name localhost;
+              auth_basic "Restricted Area";
+              auth_basic_user_file /etc/nginx/.htpasswd;
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+              }
+          }
+        mode: '0644'
+      tags: web
+
+    - name: Create .htpasswd for Basic Auth
+      copy:
+        dest: "{{ work_dir }}/.htpasswd"
+        content: "{{ htpasswd_content }}"
+        mode: '0600'
+      tags: web
+
+    - name: Create entrypoint script
+      copy:
+        dest: "{{ work_dir }}/entrypoint.sh"
+        content: |
+          #!/bin/sh
+          echo "<!DOCTYPE html>
+          <html>
+          <head><title>Secure Web App</title></head>
+          <body>
+              <h1>Welcome</h1>
+              <p>Your secret token: $SECRET_TOKEN</p>
+          </body>
+          </html>" > /usr/share/nginx/html/index.html
+          exec nginx -g 'daemon off;'
+        mode: '0755'
+      tags: web
+
+    - name: Create Dockerfile
+      copy:
+        dest: "{{ work_dir }}/Dockerfile"
+        content: |
+          FROM nginx:stable
+          COPY conf.d /etc/nginx/conf.d
+          COPY .htpasswd /etc/nginx/.htpasswd
+          COPY entrypoint.sh /entrypoint.sh
+          RUN chmod +x /entrypoint.sh
+          ENTRYPOINT ["/entrypoint.sh"]
+        mode: '0644'
+      tags: docker
+
+    - name: Build custom Nginx image
+      docker_image:
+        name: custom-nginx
+        tag: latest
+        source: build
+        build:
+          path: "{{ work_dir }}"
+          dockerfile: "{{ work_dir }}/Dockerfile"
+        state: present
+      tags: docker
+
+    - name: Scan Nginx image for vulnerabilities
+      command: trivy image --severity HIGH,CRITICAL custom-nginx:latest
+      register: trivy_scan
+      failed_when: "'CRITICAL' in trivy_scan.stdout"
+      tags: docker
+
+    - name: Run Nginx container
+      docker_container:
+        name: "{{ container_name }}"
+        image: "custom-nginx:latest"
+        state: started
+        restart_policy: always
+        ports:
+          - "8080:80"
+        volumes:
+          - "{{ work_dir }}:/usr/share/nginx/html:ro"
+        env:
+          SECRET_TOKEN: "{{ secret_token.stdout }}"
+      tags: docker
+
+    - name: Grant passwordless sudo to app user
+      copy:
+        dest: "/etc/sudoers.d/{{ app_user }}"
+        content: "{{ app_user }} ALL=(ALL) NOPASSWD:ALL"
+        mode: '0440'
+      tags: sudoers
